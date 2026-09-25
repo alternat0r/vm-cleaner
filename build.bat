@@ -33,4 +33,16 @@ set "BLD=0"
 echo [build.bat] version %MAJ%.%MIN%.%BLD%
 
 "%VSDIR%\MSBuild\Current\Bin\MSBuild.exe" vm-cleaner.sln /p:Configuration=Release /p:Platform=x64 /nologo /m /v:m
-exit /b %errorlevel%
+if errorlevel 1 (
+  exit /b %errorlevel%
+)
+
+REM ---- strip intermediate debug artifacts (keep only the final exe) ----
+set "INT=vm-cleaner\x64\Release"
+if exist "%INT%" (
+  del /q "%INT%\*.obj"     "%INT%\*.iobj"    "%INT%\*.pdb"  "%INT%\*.ipdb"  "%INT%\*.ilk"   "%INT%\*.idb"  "%INT%\*.res"  "%INT%\*.recipe" "%INT%\*.lastbuildstate" 2>nul
+  if exist "%INT%\vm-cleaner.tlog" rmdir /s /q "%INT%\vm-cleaner.tlog" 2>nul
+)
+echo [build.bat] stripped intermediate debug artifacts from %INT%
+exit /b 0
+
