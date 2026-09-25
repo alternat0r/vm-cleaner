@@ -5,6 +5,15 @@ hypervisor (VirtualBox, VMware, Hyper-V, QEMU/KVM, Parallels, ...) across all
 local drives and the registry, groups them per-VM, reports reclaimable space,
 and can recycle or delete them. Writes a timestamped log.
 
+## Use case
+
+Designed for bulk cleanup of shared / multi-seat machines — training rooms,
+cybercafes, school labs, internet kiosks — where many users leave behind
+VirtualBox / VMware / Hyper-V / QEMU images. One dry-run finds everything and
+reports reclaimable space; `/recycle` or `/delete` then clears it in a single
+pass, with in-use files skipped so a machine still running a VM is never
+corrupted.
+
 ## Build
 
 Run `build.bat` (VS2022 Community, x64, Release, static /MT). Output:
