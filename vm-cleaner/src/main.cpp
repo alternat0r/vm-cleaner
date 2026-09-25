@@ -13,6 +13,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 
 #pragma comment(lib, "advapi32.lib")
@@ -63,6 +64,17 @@ static const VmExtDef g_exts[] = {
     { L".iso",       L"Optical disk image", false },
     { L".wim",       L"Windows imaging (WIM)", false },
 };
+
+// ---------------------------------------------------------------------------
+// Archives that may contain VM images. Only flagged when larger than the
+// threshold (a VM disk archive is rarely small). core=false -> "loose" group.
+// ---------------------------------------------------------------------------
+static const wchar_t* g_archiveExts[] = {
+    L".zip", L".7z", L".rar", L".tar.gz", L".tgz", L".tar", L".gz",
+    L".tar.bz2", L".tbz2", L".tbz", L".tar.xz", L".txz", L".bz2", L".xz",
+};
+static const wchar_t* g_archiveType = L"Archive (may contain VM image)";
+static unsigned int g_minArchiveMB = 200; // size threshold, in MB
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -207,12 +219,21 @@ static ULONGLONG g_dirsScanned = 0;
 
 struct VmMatch { std::wstring type; bool core; };
 
-static VmMatch MatchVmType(const std::wstring& nameLower) {
+static VmMatch MatchVmType(const std::wstring& nameLower, ULONGLONG size) {
     for (const auto& e : g_exts) {
         size_t len = wcslen(e.suffix);
         if (nameLower.size() >= len &&
             nameLower.compare(nameLower.size() - len, len, e.suffix) == 0)
             return { e.type, e.core };
+    }
+    ULONGLONG thresh = (ULONGLONG)g_minArchiveMB * 1024ULL * 1024ULL;
+    if (size >= thresh) {
+        for (const wchar_t* s : g_archiveExts) {
+            size_t len = wcslen(s);
+            if (nameLower.size() >= len &&
+                nameLower.compare(nameLower.size() - len, len, s) == 0)
+                return { g_archiveType, false };
+        }
     }
     return { L"", false };
 }
@@ -260,12 +281,11 @@ static void ScanDirectory(const std::wstring& dir, Logger& log, bool isRoot) {
             g_dirsScanned++;
             ScanDirectory(Join(dir, name), log, false);
         } else {
-            VmMatch m = MatchVmType(ToLowerW(name));
-            if (!m.type.empty()) {
-                ULONGLONG size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                if (size == 0) continue; // skip empty placeholder/breadcrumb files
+            ULONGLONG size = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            if (size == 0) continue; // skip empty placeholder/breadcrumb files
+            VmMatch m = MatchVmType(ToLowerW(name), size);
+            if (!m.type.empty())
                 RecordFinding(log, Join(dir, name), size, m.type, m.core);
-            }
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -462,7 +482,7 @@ static void PrintGroupedReport(Logger& log) {
     if (vmCount == 0) log.Log(L"  (none)");
 
     log.Log(L"");
-    log.Log(L"== Loose disk images (reclaimable) ==");
+    log.Log(L"== Loose disk images & archives (reclaimable) ==");
     ULONGLONG looseBytes = 0, looseCount = 0;
     for (const auto& g : v) if (!g.hasCore) {
         looseBytes += g.bytes;
@@ -643,6 +663,7 @@ static void PrintUsage(Output& out) {
     out.Print(L"  vmcleaner.exe /yes            skip the confirmation prompt\r\n");
     out.Print(L"  vmcleaner.exe /accept         record license agreement without prompting\r\n");
     out.Print(L"  vmcleaner.exe /log:<path>     write log to a specific file\r\n");
+    out.Print(L"  vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)\r\n");
     out.Print(L"  vmcleaner.exe /noregistry     skip registry detection\r\n");
     out.Print(L"\r\nExamples:\r\n");
     out.Print(L"  vmcleaner.exe /delete                      delete after typing YES\r\n");
@@ -663,6 +684,10 @@ int wmain(int argc, wchar_t* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
         if (a.rfind(L"/log:", 0) == 0)                 logOverride = a.substr(5);
+        else if (a.rfind(L"/minsize:", 0) == 0) {
+            unsigned v = (unsigned)wcstoul(a.c_str() + 9, nullptr, 10);
+            if (v) g_minArchiveMB = v;
+        }
         else if (a == L"/noregistry" || a == L"--noregistry") skipRegistry = true;
         else if (a == L"/recycle" || a == L"--recycle")      mode = CleanMode::Recycle;
         else if (a == L"/delete"  || a == L"--delete")       mode = CleanMode::Delete;
@@ -700,6 +725,8 @@ int wmain(int argc, wchar_t* argv[]) {
 
     log.Log(L"VM Cleaner v" VERSION_STRING L" - VM disk image finder");
     log.Log(L"Scan started: " + NowStamp());
+    log.Log(L"Archive threshold: >= " + std::to_wstring(g_minArchiveMB) +
+            L" MB (.zip .7z .rar .tar.gz .tgz .tar .gz .bz2 .xz .tbz2 .txz)");
 
     if (!customPath.empty()) {
         log.Log(L"Target path: " + customPath);
@@ -711,16 +738,15 @@ int wmain(int argc, wchar_t* argv[]) {
             ScanDirectory(customPath, log, false);
             log.Log(L"  (" + std::to_wstring(g_dirsScanned) + L" directories scanned)");
         } else if (attr != INVALID_FILE_ATTRIBUTES) {
-            VmMatch m = MatchVmType(ToLowerW(customPath));
-            if (!m.type.empty()) {
-                WIN32_FILE_ATTRIBUTE_DATA fad;
-                if (GetFileAttributesExW(customPath.c_str(), GetFileExInfoStandard, &fad)) {
-                    ULONGLONG size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-                    RecordFinding(log, customPath, size, m.type, m.core);
-                }
-            } else {
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            ULONGLONG size = 0;
+            if (GetFileAttributesExW(customPath.c_str(), GetFileExInfoStandard, &fad))
+                size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            VmMatch m = MatchVmType(ToLowerW(customPath), size);
+            if (!m.type.empty())
+                RecordFinding(log, customPath, size, m.type, m.core);
+            else
                 log.Log(L"  (not a VM image file)");
-            }
         } else {
             log.Log(L"ERROR: path not found: " + customPath);
         }

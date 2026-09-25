@@ -42,6 +42,7 @@ It commits the source, pushes, and creates a tagged GitHub release
     vmcleaner.exe /yes            skip the confirmation prompt
     vmcleaner.exe /accept         record license agreement without prompting
     vmcleaner.exe /log:<path>     write log to a specific file
+    vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)
     vmcleaner.exe /noregistry     skip registry detection
 
 Examples:
@@ -70,6 +71,10 @@ Disk images: `.vdi .vmdk .vhdx .vhd .avhdx .avhd .qcow2 .qcow .qed .cow`
 
 Config / state: `.vbox .vbox-prev .vmx .vmem .vmsd .vmsn .vmxf .vmss .vswp`
 `.nvram .vmcx .vmrs .vmgs`
+
+Archives (may contain a VM image) — only when at least the size threshold
+(default 200 MB, tune with `/minsize:<MB>`):
+`.zip .7z .rar .tar.gz .tgz .tar .gz .tar.bz2 .tbz2 .tbz .tar.xz .txz .bz2 .xz`
 
 Registry probes: VirtualBox (`DefaultMachineFolder` / `InstallDir` / `Version`),
 VMware Workstation (`InstallPath` / VM path), Hyper-V feature key + `vmms.exe`,
