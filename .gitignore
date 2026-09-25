@@ -1,6 +1,7 @@
 # --- personal / deployment scripts (do not commit) ---
 notes.txt
 push.bat
+release.bat
 
 # --- build output ---
 bin/
