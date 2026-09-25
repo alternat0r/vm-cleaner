@@ -20,19 +20,6 @@ Run `build.bat` (VS2022 Community, x64, Release, static /MT). Output:
 `bin\x64\Release\vmcleaner.exe`. `src\version.h` auto-increments the **minor**
 version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
 
-## Release
-
-Run `release.bat` to publish to GitHub:
-
-    release.bat            build (minor bump) + commit + push + gh release
-    release.bat /dryrun    build + report the version, no push / no release
-
-It commits the source, pushes, and creates a tagged GitHub release
-(`vMAJ.MIN.BLD`) with `vmcleaner.exe` attached as an asset, using the
-`push.bat` helper and the `gh` CLI. Requires `gh` to be authenticated
-(`gh auth login`).
-
-
 ## Usage
 
     vmcleaner.exe                 dry-run: scan all drives + registry, report only
