@@ -30,6 +30,7 @@ version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
     vmcleaner.exe /accept         record license agreement without prompting
     vmcleaner.exe /log:<path>     write log to a specific file
     vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)
+    vmcleaner.exe /ext:<a,b,...>  also match these custom file extensions
     vmcleaner.exe /noregistry     skip registry detection
     vmcleaner.exe /csv:<path>     also write a CSV report
     vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)
@@ -99,6 +100,13 @@ Registry probes: VirtualBox (`DefaultMachineFolder` / `InstallDir` / `Version`),
 VMware Workstation (`InstallPath` / VM path), Hyper-V feature key + `vmms.exe`,
 and any installed app whose DisplayName matches a VM vendor (uninstall keys —
 64-bit, 32-bit, and per-user).
+
+Custom extensions: `/ext:<a,b,...>` adds user-defined extensions to the match
+list (e.g. `/ext:vmsave,mydisk`). Tokens are case-insensitive, the dot is
+optional, letters/digits only (max 24 chars), comma-separated, repeatable.
+Custom extensions are treated as **core** VM files (they group a folder as a
+VM folder) and are recorded in the log; they also carry over into a
+self-scheduled `/task`.
 
 ## Report
 

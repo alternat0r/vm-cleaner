@@ -95,6 +95,48 @@ static std::string ToUtf8(const std::wstring& w) {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// User-supplied custom file extensions (/ext:). Each is matched as a core
+// VM file (grouped as a VM folder) and listed in the log.
+// ---------------------------------------------------------------------------
+static std::vector<std::wstring> g_customExts;   // lowercased, with leading dot
+static std::wstring g_customExtsArg;             // accepted tokens, joined (for logging)
+
+static bool IsExtCharW(wchar_t c) { return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z'); }
+
+// Normalize one /ext: token to a lowercased suffix starting with '.'.
+// Returns false if the token is empty or invalid.
+static bool NormalizeExtToken(const std::wstring& t, std::wstring& out) {
+    std::wstring s = ToLowerW(t);
+    size_t a = s.find_first_not_of(L" \t\r\n,");
+    size_t b = s.find_last_not_of(L" \t\r\n,");
+    if (a == std::wstring::npos || b < a) return false;   // empty token
+    s = s.substr(a, b - a + 1);
+    if (s[0] == L'.') s.erase(0, 1);                       // dot optional in input
+    if (s.empty() || s.size() > 24) return false;
+    for (wchar_t c : s)
+        if (!IsExtCharW(c)) return false;
+    out = L"." + s;
+    return true;
+}
+
+// Parse a comma-separated /ext: value; appends normalized suffixes to `exts`.
+// Returns the number of valid tokens added.
+static int ParseCustomExts(const std::wstring& value, std::vector<std::wstring>& exts) {
+    int n = 0;
+    size_t start = 0;
+    while (start <= value.size()) {
+        size_t comma = value.find(L',', start);
+        if (comma == std::wstring::npos) comma = value.size();
+        if (comma > start) {
+            std::wstring norm;
+            if (NormalizeExtToken(value.substr(start, comma - start), norm)) { exts.push_back(norm); n++; }
+        }
+        start = comma + 1;
+    }
+    return n;
+}
+
 static std::wstring FormatSize(ULONGLONG bytes) {
     if (bytes < 1024) {
         wchar_t b[64];
@@ -226,6 +268,12 @@ static VmMatch MatchVmType(const std::wstring& nameLower, ULONGLONG size) {
         if (nameLower.size() >= len &&
             nameLower.compare(nameLower.size() - len, len, e.suffix) == 0)
             return { e.type, e.core };
+    }
+    for (const auto& s : g_customExts) {
+        size_t len = s.size();
+        if (nameLower.size() >= len &&
+            nameLower.compare(nameLower.size() - len, len, s.c_str()) == 0)
+            return { L"Custom (" + s.substr(1) + L")", true };
     }
     ULONGLONG thresh = (ULONGLONG)g_minArchiveMB * 1024ULL * 1024ULL;
     if (size >= thresh) {
@@ -566,7 +614,7 @@ static std::string CsvEscape(const std::wstring& w) {
 // Requires admin to register machine tasks (schtasks /Create fails otherwise).
 // ---------------------------------------------------------------------------
 static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYes,
-                               const std::wstring& csvPath) {
+                               const std::wstring& csvPath, const std::wstring& extArg) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L"";
     std::wstring c = L"\"" + std::wstring(exe) + L"\"";
@@ -575,6 +623,7 @@ static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYe
     else if (mode == CleanMode::Delete) c += L" /delete";
     if (assumeYes) c += L" /yes";
     if (!csvPath.empty()) c += L" /csv:" + csvPath;
+    if (!extArg.empty()) c += L" /ext:" + extArg;
     return c;
 }
 
@@ -602,11 +651,12 @@ static int RunHidden(const wchar_t* app, const wchar_t* args) {
 }
 
 static void ScheduleTask(Logger& log, int day, CleanMode mode, bool assumeYes,
-                         bool assumeLicense, const std::wstring& csvPath) {
+                         bool assumeLicense, const std::wstring& csvPath,
+                         const std::wstring& extArg) {
     static const wchar_t* dayNames[] = { L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun" };
     if (day < 1 || day > 7) day = 7;
     std::wstring dn = dayNames[day - 1];
-    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath);
+    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg);
     if (cmd.empty()) { log.Log(L"ERROR: cannot determine executable path."); return; }
     std::wstring schedArgs = L"/create /tn VMCleaner /tr \"" + cmd + L"\" /sc weekly /d " +
                              dn + L" /st 03:30 /f";
@@ -837,6 +887,7 @@ static void PrintUsage(Output& out) {
     out.Print(L"  vmcleaner.exe /accept         record license agreement without prompting\r\n");
     out.Print(L"  vmcleaner.exe /log:<path>     write log to a specific file\r\n");
     out.Print(L"  vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)\r\n");
+    out.Print(L"  vmcleaner.exe /ext:<a,b,...>  also match these custom file extensions\r\n");
     out.Print(L"  vmcleaner.exe /noregistry     skip registry detection\r\n");
     out.Print(L"  vmcleaner.exe /csv:<path>     also write a CSV report\r\n");
     out.Print(L"                              columns: host,vm,group,type,path,size_bytes,status\r\n");
@@ -860,6 +911,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring customPath;
     std::wstring logOverride;
     std::wstring csvOverride;
+    std::vector<std::wstring> customExts;
     int taskOp = 0; // 0=off(no action)  1..7=register on that day  -1=unregister
 
     for (int i = 1; i < argc; i++) {
@@ -870,6 +922,15 @@ int wmain(int argc, wchar_t* argv[]) {
             if (v) g_minArchiveMB = v;
         }
         else if (a.rfind(L"/csv:", 0) == 0)            csvOverride = a.substr(5);
+        else if (a.rfind(L"/ext:", 0) == 0) {
+            size_t before = customExts.size();
+            ParseCustomExts(a.substr(5), customExts);
+            if (customExts.size() == before) {
+                Output o;
+                o.Print(L"WARNING: /ext:" + a.substr(5) +
+                        L" - no valid extension tokens (letters/digits, max 24 chars, comma-separated)\r\n");
+            }
+        }
         else if (a.rfind(L"/task:", 0) == 0) {
             std::wstring d = ToLowerW(a.substr(6));
             if (d == L"off") taskOp = -1;
@@ -890,6 +951,13 @@ int wmain(int argc, wchar_t* argv[]) {
             Output o; PrintUsage(o); return 0;
         }
         else if (!a.empty() && a[0] != L'/') customPath = a;
+    }
+
+    // Store accepted custom extensions for matching + re-logging.
+    g_customExts = customExts;
+    for (size_t i = 0; i < g_customExts.size(); i++) {
+        if (i) g_customExtsArg += L",";
+        g_customExtsArg += g_customExts[i];
     }
 
     // License must be agreed before any task (scan or cleanup) runs.
@@ -937,6 +1005,8 @@ int wmain(int argc, wchar_t* argv[]) {
     log.Log(L"Scan started: " + NowStamp());
     log.Log(L"Archive threshold: >= " + std::to_wstring(g_minArchiveMB) +
             L" MB (.zip .7z .rar .tar.gz .tgz .tar .gz .bz2 .xz .tbz2 .txz)");
+    if (!g_customExts.empty())
+        log.Log(L"Custom extensions: " + g_customExtsArg + L" (matched as core VM files)");
 
     if (!customPath.empty()) {
         log.Log(L"Target path: " + customPath);
@@ -969,7 +1039,7 @@ int wmain(int argc, wchar_t* argv[]) {
     log.Log(L"Scan finished: " + NowStamp());
     PrintGroupedReport(log);
 
-    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride);
+    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg);
 
     int failed = 0;
     if (mode != CleanMode::None)
