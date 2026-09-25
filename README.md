@@ -101,6 +101,13 @@ VMware Workstation (`InstallPath` / VM path), Hyper-V feature key + `vmms.exe`,
 and any installed app whose DisplayName matches a VM vendor (uninstall keys —
 64-bit, 32-bit, and per-user).
 
+Installed-software versions (user information only): for each detected VM
+product the tool logs a **version** and, when available, the **copyright**
+year range — from the uninstall key's `DisplayVersion` and from the PE version
+resource of the product's main executable (e.g. `VirtualBox.exe`, `vmware.exe`,
+`vmms.exe`). These lines are informational (marked `[for user information]`)
+to help spot outdated software; they never affect scanning or cleanup.
+
 Custom extensions: `/ext:<a,b,...>` adds user-defined extensions to the match
 list (e.g. `/ext:vmsave,mydisk`). Tokens are case-insensitive, the dot is
 optional, letters/digits only (max 24 chars), comma-separated, repeatable.

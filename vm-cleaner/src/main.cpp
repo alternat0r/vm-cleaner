@@ -19,6 +19,7 @@
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "version.lib")
 
 #include "version.h"
 
@@ -371,7 +372,90 @@ static bool KeyExists(HKEY root, const wchar_t* sub, REGSAM extra) {
     return false;
 }
 
-struct UninstallEntry { std::wstring display; std::wstring location; };
+// ---------------------------------------------------------------------------
+// PE version info (user information only): file/product version + copyright.
+// ---------------------------------------------------------------------------
+struct PeVer { std::wstring fileVer; std::wstring prodVer; std::wstring copyright; };
+
+static std::wstring VerString(const void* base, const wchar_t* key) {
+    wchar_t* out = nullptr;
+    UINT len = 0;
+    if (VerQueryValueW(base, key, (void**)&out, &len) && len) {
+        // Some resources report len that includes the NUL terminator; stop at first NUL.
+        size_t n = 0;
+        while (n < len && out[n] != L'\0') n++;
+        return std::wstring(out, n);
+    }
+    return L"";
+}
+
+static PeVer ReadPeVersion(const std::wstring& path) {
+    PeVer v;
+    DWORD size = GetFileVersionInfoSizeW(path.c_str(), nullptr);
+    if (!size) return v;
+    std::vector<char> buf(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, buf.data())) return v;
+    VS_FIXEDFILEINFO* ffi = nullptr;
+    UINT rl = 0;
+    if (VerQueryValueW(buf.data(), L"\\", (void**)&ffi, &rl) && rl >= sizeof(VS_FIXEDFILEINFO)) {
+        wchar_t b[32];
+        swprintf_s(b, L"%u.%u.%u.%u",
+            (ffi->dwFileVersionMS >> 16) & 0xFFFF, ffi->dwFileVersionMS & 0xFFFF,
+            (ffi->dwFileVersionLS >> 16) & 0xFFFF, ffi->dwFileVersionLS & 0xFFFF);
+        v.fileVer = b;
+        swprintf_s(b, L"%u.%u.%u.%u",
+            (ffi->dwProductVersionMS >> 16) & 0xFFFF, ffi->dwProductVersionMS & 0xFFFF,
+            (ffi->dwProductVersionLS >> 16) & 0xFFFF, ffi->dwProductVersionLS & 0xFFFF);
+        v.prodVer = b;
+    }
+    const WORD* trans = nullptr;
+    UINT tl = 0;
+    if (VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation", (void**)&trans, &tl) &&
+        tl >= 4) {
+        wchar_t base[32];
+        swprintf_s(base, L"\\StringFileInfo\\%04x%04x\\", trans[0], trans[1]);
+        wchar_t key[128];
+        swprintf_s(key, L"%sLegalCopyright", base);
+        v.copyright = VerString(buf.data(), key);
+        swprintf_s(key, L"%sProductVersion", base);
+        std::wstring pv = VerString(buf.data(), key);
+        if (!pv.empty()) v.prodVer = pv;   // string product version wins over numeric
+    }
+    return v;
+}
+
+// Primary executables to probe (in order) for a given install directory.
+static const wchar_t* const g_vmExes[] = {
+    L"VirtualBox.exe", L"vmware.exe", L"vmrun.exe", L"vmms.exe",
+    L"qemu-system-x86_64.exe", L"qemu-system-i386.exe", L"prlctl.exe",
+    L"vboxmanage.exe", L"vmware-vmx.exe",
+};
+
+// Locate the primary exe under `dir` (preferring `exeHint`) and log its
+// version + copyright. Informational only.
+static void LogSoftwareVersion(Logger& log, const std::wstring& label,
+                               const std::wstring& dir, const std::wstring& exeHint) {
+    if (dir.empty()) return;
+    std::wstring exePath;
+    if (!exeHint.empty()) {
+        std::wstring p = Join(dir, exeHint);
+        if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) exePath = p;
+    }
+    if (exePath.empty()) {
+        for (const auto* c : g_vmExes) {
+            std::wstring p = Join(dir, c);
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) { exePath = p; break; }
+        }
+    }
+    if (exePath.empty()) return;
+    PeVer v = ReadPeVersion(exePath);
+    if (v.fileVer.empty() && v.copyright.empty()) return;
+    log.Log(L"  " + label + L" version: " + (v.fileVer.empty() ? v.prodVer : v.fileVer) +
+            (v.copyright.empty() ? L"" : L"  [copyright: " + v.copyright + L"]") +
+            L"  (" + exePath + L")");
+}
+
+struct UninstallEntry { std::wstring display; std::wstring location; std::wstring version; };
 
 static void EnumUninstall(HKEY root, const wchar_t* base, REGSAM extra,
                           std::vector<UninstallEntry>& out) {
@@ -385,7 +469,9 @@ static void EnumUninstall(HKEY root, const wchar_t* base, REGSAM extra,
         std::wstring sub = std::wstring(base) + L"\\" + name;
         std::wstring disp = RegReadString(root, sub.c_str(), L"DisplayName", extra);
         if (disp.empty()) continue;
-        out.push_back({ disp, RegReadString(root, sub.c_str(), L"InstallLocation", extra) });
+        out.push_back({ disp,
+                        RegReadString(root, sub.c_str(), L"InstallLocation", extra),
+                        RegReadString(root, sub.c_str(), L"DisplayVersion", extra) });
     }
     RegCloseKey(k);
 }
@@ -418,11 +504,14 @@ static void DetectVmSoftware(Logger& log, std::vector<std::wstring>& extraDirs) 
     if (!vbInst.empty()) { any = true; log.Log(L"  VirtualBox InstallDir: " + vbInst); }
     std::wstring vbVer = RegReadString(HKEY_LOCAL_MACHINE,
         L"Software\\Oracle\\VirtualBox", L"Version", 0);
-    if (!vbVer.empty()) log.Log(L"  VirtualBox version: " + vbVer);
+    if (!vbVer.empty())
+        log.Log(L"  VirtualBox version (registry): " + vbVer + L"  [for user information]");
+    LogSoftwareVersion(log, L"VirtualBox", vbInst, L"VirtualBox.exe");
 
     std::wstring vmInst = RegReadString(HKEY_LOCAL_MACHINE,
         L"Software\\VMware, Inc.\\VMware Workstation", L"InstallPath", 0);
     if (!vmInst.empty()) { any = true; log.Log(L"  VMware Workstation InstallPath: " + vmInst); }
+    LogSoftwareVersion(log, L"VMware Workstation", vmInst, L"vmware.exe");
     std::wstring vmDef = RegReadString(HKEY_CURRENT_USER,
         L"Software\\VMware, Inc.\\VMware Workstation", L"VMware VMs Path", 0);
     if (!vmDef.empty()) {
@@ -437,6 +526,7 @@ static void DetectVmSoftware(Logger& log, std::vector<std::wstring>& extraDirs) 
     if (GetFileAttributesW(L"C:\\Windows\\System32\\vmms.exe") != INVALID_FILE_ATTRIBUTES) {
         any = true;
         log.Log(L"  Hyper-V Virtual Machine Management service present (vmms.exe)");
+        LogSoftwareVersion(log, L"Hyper-V (vmms.exe)", L"C:\\Windows\\System32", L"vmms.exe");
     }
 
     std::vector<UninstallEntry> entries;
@@ -451,8 +541,13 @@ static void DetectVmSoftware(Logger& log, std::vector<std::wstring>& extraDirs) 
         if (IsVmVendor(ToLowerW(e.display))) {
             any = true;
             log.Log(L"  Installed: " + e.display +
-                    (e.location.empty() ? L"" : L"  @ " + e.location));
-            if (!e.location.empty()) extraDirs.push_back(e.location);
+                    (e.version.empty() ? L"" : L"  [version " + e.version + L"]") +
+                    (e.location.empty() ? L"" : L"  @ " + e.location) +
+                    L"  [for user information]");
+            if (!e.location.empty()) {
+                extraDirs.push_back(e.location);
+                LogSoftwareVersion(log, e.display, e.location, L"");
+            }
         }
     }
 
