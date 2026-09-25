@@ -39,17 +39,42 @@ It commits the source, pushes, and creates a tagged GitHub release
     vmcleaner.exe <path>          scan a single folder only
     vmcleaner.exe /recycle        move found VM files to the Recycle Bin
     vmcleaner.exe /delete         permanently delete found VM files
-    vmcleaner.exe /yes            skip the confirmation prompt
+    vmcleaner.exe /yes            skip the confirmation prompt (works with /recycle and /delete)
     vmcleaner.exe /accept         record license agreement without prompting
     vmcleaner.exe /log:<path>     write log to a specific file
     vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)
     vmcleaner.exe /noregistry     skip registry detection
+    vmcleaner.exe /csv:<path>     also write a CSV report
+    vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)
+    vmcleaner.exe /task:off      remove the self-scheduled task
 
 Examples:
 
     vmcleaner.exe                      # find everything, change nothing
     vmcleaner.exe /delete              # prompt, then delete on "YES"
     vmcleaner.exe D:\VMs /recycle /yes # recycle a folder, no prompt
+    vmcleaner.exe /recycle /yes /accept /csv:C:\fleet\results.csv   # unattended + report
+
+## Fleet mode (unattended)
+
+For deploying across many machines without interaction:
+
+- `/recycle /yes` or `/delete /yes` — no prompts at all. Combine with `/accept`
+  to also skip the one-time license agreement:
+
+      vmcleaner.exe /accept /recycle /yes
+
+- `/csv:<path>` — machine-readable report, one row per finding:
+  `host,vm,group,type,path,size_bytes,status` where `status` is
+  `found` (dry run), `recycled`, `deleted`, `skipped_in_use`, or `failed`.
+  Copy the CSV from every machine to collect fleet-wide results.
+- `/task[=<day>]` — registers a weekly Task Scheduler task named `VMCleaner`
+  (03:30, default Sunday) that re-runs this same exe with the current cleanup
+  flags, so machines clean themselves on a schedule. `/task:off` removes it.
+  Registering machine tasks needs an elevated prompt; the tool reports
+  failure gracefully otherwise.
+- Exit codes: `0` ok, `1` error, `2` license declined, `3` cleanup had
+  failure(s) — convenient for batch files and remote scripts.
 
 ## License gate
 
