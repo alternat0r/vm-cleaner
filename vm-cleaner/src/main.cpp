@@ -712,6 +712,12 @@ static void PrintLicense(Output& o) {
     o.Print(L" 4. Provided \"as is\", without warranty of any kind.\r\n");
     o.Print(L" 5. The author is not liable for data loss or any\r\n");
     o.Print(L"    damage caused by using this tool.\r\n");
+    o.Print(L"\r\n");
+    o.Print(L" DISCLAIMER: This tool is provided \"as is\", without any\r\n");
+    o.Print(L"    warranty. The author accepts no liability for data loss,\r\n");
+    o.Print(L"    corruption, or any other damage caused by its use.\r\n");
+    o.Print(L"    Always review the report (run a dry-run first) before\r\n");
+    o.Print(L"    deleting anything.\r\n");
     o.Print(L"====================================================\r\n");
 }
 
@@ -735,6 +741,29 @@ static bool LicenseGate(bool assumeLicense) {
     return true;
 }
 
+// Is the current process running with elevated (administrator) rights?
+static bool IsElevated() {
+    BOOL elevated = FALSE;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION te = {};
+        DWORD sz = 0;
+        if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &sz))
+            elevated = (te.TokenIsElevated != 0);
+        CloseHandle(tok);
+    }
+    return elevated;
+}
+
+// Warn before any permanent deletion: irreversibility + admin requirement
+// + disclaimer. Goes to console AND log (unattended runs see it too).
+static void PrintDeleteWarning(Logger& log) {
+    log.Log(L"WARNING: /delete is PERMANENT - deleted files cannot be recovered.");
+    if (!IsElevated())
+        log.Log(L"WARNING: not running as administrator. Deleting files in system-protected locations (e.g. C:\\ProgramData, Windows) or files owned by other users requires administrator rights; such files may fail to delete. Re-run elevated for full coverage.");
+    log.Log(L"DISCLAIMER: The author accepts no liability for data loss or damage caused by this tool.");
+}
+
 static int PerformCleanup(Logger& log, CleanMode mode, bool assumeYes) {
     if (g_findings.empty()) {
         log.Log(L"Nothing to clean.");
@@ -742,6 +771,9 @@ static int PerformCleanup(Logger& log, CleanMode mode, bool assumeYes) {
     }
     ULONGLONG totalBytes = 0;
     for (const auto& f : g_findings) totalBytes += f.size;
+
+    if (mode == CleanMode::Delete)
+        PrintDeleteWarning(log);
 
     if (!assumeYes) {
         Output o;
@@ -800,7 +832,7 @@ static void PrintUsage(Output& out) {
     out.Print(L"  vmcleaner.exe                 scan (dry-run): all drives + registry\r\n");
     out.Print(L"  vmcleaner.exe <path>          scan a single folder only\r\n");
     out.Print(L"  vmcleaner.exe /recycle        move found VM files to Recycle Bin\r\n");
-    out.Print(L"  vmcleaner.exe /delete         permanently delete found VM files\r\n");
+    out.Print(L"  vmcleaner.exe /delete         permanently delete found VM files (admin needed for protected files)\r\n");
     out.Print(L"  vmcleaner.exe /yes            skip the confirmation prompt (works with /recycle and /delete)\r\n");
     out.Print(L"  vmcleaner.exe /accept         record license agreement without prompting\r\n");
     out.Print(L"  vmcleaner.exe /log:<path>     write log to a specific file\r\n");

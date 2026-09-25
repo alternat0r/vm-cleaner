@@ -38,7 +38,7 @@ It commits the source, pushes, and creates a tagged GitHub release
     vmcleaner.exe                 dry-run: scan all drives + registry, report only
     vmcleaner.exe <path>          scan a single folder only
     vmcleaner.exe /recycle        move found VM files to the Recycle Bin
-    vmcleaner.exe /delete         permanently delete found VM files
+    vmcleaner.exe /delete         permanently delete found VM files (admin rights needed for protected files)
     vmcleaner.exe /yes            skip the confirmation prompt (works with /recycle and /delete)
     vmcleaner.exe /accept         record license agreement without prompting
     vmcleaner.exe /log:<path>     write log to a specific file
@@ -75,12 +75,19 @@ For deploying across many machines without interaction:
   failure gracefully otherwise.
 - Exit codes: `0` ok, `1` error, `2` license declined, `3` cleanup had
   failure(s) — convenient for batch files and remote scripts.
+- `/delete` always prints a **warning + disclaimer** before deleting
+  (console and log, even with `/yes`). When the process is **not elevated**,
+  an extra admin warning is printed — files in system-protected locations
+  (e.g. `C:\ProgramData`) or owned by other users require administrator
+  rights and will otherwise fail to delete. Run elevated for full coverage.
 
 ## License gate
 
-On first run the tool shows a short license agreement and requires the user to
-agree before **any** task (scan or cleanup) runs. Declining aborts immediately
-(exit code 2, nothing scanned or changed).
+On first run the tool shows a short license agreement **and disclaimer**
+("as is", no warranty, no liability for data loss or damage; review a
+dry-run before deleting) and requires the user to agree before **any** task
+(scan or cleanup) runs. Declining aborts immediately (exit code 2, nothing
+scanned or changed).
 
 Acceptance is persisted per-user in the registry
 (`HKCU\Software\VMCleaner`, `LicenseAccepted=1`), so the prompt appears only
@@ -116,11 +123,15 @@ total reclaimable-size line closes the report.
 ## Cleanup behaviour
 
 - `/delete` requires typing `YES` (or `/yes`); `/recycle` requires `y`.
+- Before any `/delete` the tool prints: a permanence warning, a disclaimer
+  (no warranty / no liability), and — when not elevated — an **admin warning**
+  (protected or foreign-owned files need administrator rights and may fail).
 - Files currently open by another process (e.g. a running VM) are detected and
   **skipped**, never forced.
 - `/recycle` uses the Recycle Bin (`FOF_ALLOWUNDO`) — recoverable. On removable
   or network drives Windows may fall back to permanent deletion.
-- `/delete` is permanent and not recoverable.
+- `/delete` is permanent and not recoverable. Run as administrator when the
+  targets include system-protected locations (e.g. `C:\ProgramData\Microsoft\Windows\Hyper-V`).
 
 ## Notes
 
