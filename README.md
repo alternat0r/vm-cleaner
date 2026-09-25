@@ -17,7 +17,21 @@ corrupted.
 ## Build
 
 Run `build.bat` (VS2022 Community, x64, Release, static /MT). Output:
-`bin\x64\Release\vmcleaner.exe`. `src\version.h` auto-increments on every build.
+`bin\x64\Release\vmcleaner.exe`. `src\version.h` auto-increments the **minor**
+version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
+
+## Release
+
+Run `release.bat` to publish to GitHub:
+
+    release.bat            build (minor bump) + commit + push + gh release
+    release.bat /dryrun    build + report the version, no push / no release
+
+It commits the source, pushes, and creates a tagged GitHub release
+(`vMAJ.MIN.BLD`) with `vmcleaner.exe` attached as an asset, using the
+`push.bat` helper and the `gh` CLI. Requires `gh` to be authenticated
+(`gh auth login`).
+
 
 ## Usage
 
@@ -26,6 +40,7 @@ Run `build.bat` (VS2022 Community, x64, Release, static /MT). Output:
     vmcleaner.exe /recycle        move found VM files to the Recycle Bin
     vmcleaner.exe /delete         permanently delete found VM files
     vmcleaner.exe /yes            skip the confirmation prompt
+    vmcleaner.exe /accept         record license agreement without prompting
     vmcleaner.exe /log:<path>     write log to a specific file
     vmcleaner.exe /noregistry     skip registry detection
 
@@ -34,6 +49,19 @@ Examples:
     vmcleaner.exe                      # find everything, change nothing
     vmcleaner.exe /delete              # prompt, then delete on "YES"
     vmcleaner.exe D:\VMs /recycle /yes # recycle a folder, no prompt
+
+## License gate
+
+On first run the tool shows a short license agreement and requires the user to
+agree before **any** task (scan or cleanup) runs. Declining aborts immediately
+(exit code 2, nothing scanned or changed).
+
+Acceptance is persisted per-user in the registry
+(`HKCU\Software\VMCleaner`, `LicenseAccepted=1`), so the prompt appears only
+once. For scripted / bulk deployment (training rooms, cybercafes) use
+`/accept` to record agreement without an interactive prompt:
+
+    vmcleaner.exe /accept /delete /yes
 
 ## What it detects
 

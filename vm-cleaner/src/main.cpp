@@ -516,6 +516,68 @@ static std::string ReadLineA() {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// License gate: user must agree before any task runs.
+// Acceptance is persisted under HKCU\Software\VMCleaner (prompted once).
+// ---------------------------------------------------------------------------
+static const wchar_t* LICENSE_KEY = L"Software\\VMCleaner";
+
+static bool LicenseAccepted() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, LICENSE_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return false;
+    DWORD v = 0, sz = sizeof(v);
+    LONG r = RegQueryValueExW(k, L"LicenseAccepted", nullptr, nullptr, (LPBYTE)&v, &sz);
+    RegCloseKey(k);
+    return (r == ERROR_SUCCESS && v == 1);
+}
+
+static void MarkLicenseAccepted() {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, LICENSE_KEY, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD v = 1;
+    RegSetValueExW(k, L"LicenseAccepted", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(k);
+}
+
+static void PrintLicense(Output& o) {
+    o.Print(L"====================================================\r\n");
+    o.Print(L" VM CLEANER - LICENSE AGREEMENT\r\n");
+    o.Print(L"====================================================\r\n");
+    o.Print(L" 1. This tool finds and removes virtual machine disk\r\n");
+    o.Print(L"    images and configuration files.\r\n");
+    o.Print(L" 2. /delete is PERMANENT and cannot be undone. Use\r\n");
+    o.Print(L"    /recycle when you want recovery.\r\n");
+    o.Print(L" 3. Only remove files you own or are authorized to\r\n");
+    o.Print(L"    remove on this machine.\r\n");
+    o.Print(L" 4. Provided \"as is\", without warranty of any kind.\r\n");
+    o.Print(L" 5. The author is not liable for data loss or any\r\n");
+    o.Print(L"    damage caused by using this tool.\r\n");
+    o.Print(L"====================================================\r\n");
+}
+
+static bool LicenseGate(bool assumeLicense) {
+    if (LicenseAccepted()) return true;
+    Output o;
+    PrintLicense(o);
+    if (assumeLicense) {
+        MarkLicenseAccepted();
+        o.Print(L"License accepted via /accept flag.\r\n");
+        return true;
+    }
+    o.Print(L"Do you agree to the above terms? [y/N]: ");
+    std::string ans = ReadLineA();
+    if (ans != "y" && ans != "Y" && ans != "yes" && ans != "YES") {
+        o.Print(L"Aborted - license not accepted. No action was performed.\r\n");
+        return false;
+    }
+    MarkLicenseAccepted();
+    o.Print(L"License accepted.\r\n");
+    return true;
+}
+
 static void PerformCleanup(Logger& log, CleanMode mode, bool assumeYes) {
     if (g_findings.empty()) {
         log.Log(L"Nothing to clean.");
@@ -579,6 +641,7 @@ static void PrintUsage(Output& out) {
     out.Print(L"  vmcleaner.exe /recycle        move found VM files to Recycle Bin\r\n");
     out.Print(L"  vmcleaner.exe /delete         permanently delete found VM files\r\n");
     out.Print(L"  vmcleaner.exe /yes            skip the confirmation prompt\r\n");
+    out.Print(L"  vmcleaner.exe /accept         record license agreement without prompting\r\n");
     out.Print(L"  vmcleaner.exe /log:<path>     write log to a specific file\r\n");
     out.Print(L"  vmcleaner.exe /noregistry     skip registry detection\r\n");
     out.Print(L"\r\nExamples:\r\n");
@@ -592,6 +655,7 @@ static void PrintUsage(Output& out) {
 int wmain(int argc, wchar_t* argv[]) {
     CleanMode mode = CleanMode::None;
     bool assumeYes = false;
+    bool assumeLicense = false;
     bool skipRegistry = false;
     std::wstring customPath;
     std::wstring logOverride;
@@ -603,11 +667,15 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (a == L"/recycle" || a == L"--recycle")      mode = CleanMode::Recycle;
         else if (a == L"/delete"  || a == L"--delete")       mode = CleanMode::Delete;
         else if (a == L"/yes" || a == L"--yes" || a == L"-y") assumeYes = true;
+        else if (a == L"/accept" || a == L"--accept")        assumeLicense = true;
         else if (a == L"/?" || a == L"--help" || a == L"-h" || a == L"-help") {
             Output o; PrintUsage(o); return 0;
         }
         else if (!a.empty() && a[0] != L'/') customPath = a;
     }
+
+    // License must be agreed before any task (scan or cleanup) runs.
+    if (!LicenseGate(assumeLicense)) return 2;
 
     // Absolute-ize the custom path so findings are absolute (required for SHFileOperation).
     if (!customPath.empty()) {

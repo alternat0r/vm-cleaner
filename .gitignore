@@ -1,0 +1,41 @@
+# --- personal / deployment scripts (do not commit) ---
+notes.txt
+push.bat
+
+# --- build output ---
+bin/
+vm-cleaner/x64/
+vm-cleaner/Debug/
+vm-cleaner/Release/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+# --- Visual Studio user/settings files ---
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.VC.VC.opendb
+
+# --- MSVC intermediate / compiler artifacts ---
+*.obj
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.idb
+*.res
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+
+# --- misc ---
+*.tmp
+Thumbs.db
+Desktop.ini
