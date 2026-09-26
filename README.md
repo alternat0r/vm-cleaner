@@ -14,6 +14,14 @@ reports reclaimable space; `/recycle` or `/delete` then clears it in a single
 pass, with in-use files skipped so a machine still running a VM is never
 corrupted.
 
+## License
+
+Copyright (c) 2026 Kamil Alta. VM Cleaner is licensed under the Creative
+Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0) —
+see [`LICENSE`](LICENSE). You may copy and redistribute the code and release
+binary for **non-commercial** purposes with attribution. Commercial use
+requires separate permission.
+
 ## Build
 
 Run `build.bat` (VS2022 Community, x64, Release, static /MT). Output:
@@ -29,8 +37,9 @@ version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
     vmcleaner.exe /yes            skip the confirmation prompt (works with /recycle and /delete)
     vmcleaner.exe /accept         record license agreement without prompting
     vmcleaner.exe /log:<path>     write log to a specific file
-    vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)
+    vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB; 0 = never flag archives)
     vmcleaner.exe /ext:<a,b,...>  also match these custom file extensions
+    vmcleaner.exe /only:<vendor>  only report/clean one vendor (see Vendor filter)
     vmcleaner.exe /noregistry     skip registry detection
     vmcleaner.exe /csv:<path>     also write a CSV report
     vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)
@@ -114,6 +123,19 @@ optional, letters/digits only (max 24 chars), comma-separated, repeatable.
 Custom extensions are treated as **core** VM files (they group a folder as a
 VM folder) and are recorded in the log; they also carry over into a
 self-scheduled `/task`.
+
+Vendor filter: `/only:<vendor>` limits the scan (and any cleanup) to a single
+vendor. The vendor of each finding is taken from the type label shown in the
+report. Accepted values (case-insensitive): `all` (default), `virtualbox`,
+`vmware`, `hyperv`, `qemu`, `parallels`, `ovf`, `apple`, `generic` (`.img` /
+`.raw` / `.dsk`), `wim`, `archive`, `custom` (files matched via `/ext:`), and
+`other` (anything unmatched, e.g. `.iso`). An unknown value prints a warning
+and scans all vendors. The filter is logged at startup and carries over into a
+self-scheduled `/task`.
+Example: `vmcleaner.exe /only:vmware /recycle` touches only VMware files.
+Note: `.vhd`/`.vhdx` are classified as Hyper-V. `.nvram` carries the label
+"VMware/QEMU (NVRAM)" and therefore classifies to the **vmware** bucket, so
+`/only:qemu` excludes it.
 
 ## Report
 

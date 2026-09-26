@@ -1,6 +1,7 @@
 // vm-cleaner.cpp — find VM disk images (any vendor) across drives + registry, log results,
 // group them per-VM, and optionally recycle/delete them.
 // Builds with MSVC 2022 (/MT static, Unicode). No external dependencies.
+// Copyright (c) 2026 Kamil Alta. Licensed under CC BY-NC 4.0 (see LICENSE).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -136,6 +137,56 @@ static int ParseCustomExts(const std::wstring& value, std::vector<std::wstring>&
         start = comma + 1;
     }
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// Vendor filter (/only:). A finding's vendor is derived from the type label
+// the user already sees (e.g. "VMware (VMDK disk)" -> vmware). Empty or "all"
+// means no filtering (the default).
+// ---------------------------------------------------------------------------
+static std::wstring g_onlyVendor; // normalized vendor id, or "all"
+
+static std::wstring VendorOf(const std::wstring& type) {
+    std::wstring t = ToLowerW(type);
+    auto starts = [&](const wchar_t* p) {
+        size_t n = wcslen(p);
+        return t.size() >= n && t.compare(0, n, p) == 0;
+    };
+    if (starts(L"virtualbox"))           return L"virtualbox";
+    if (starts(L"vmware"))               return L"vmware";
+    if (starts(L"hyper-v"))              return L"hyperv";
+    if (starts(L"qemu"))                 return L"qemu";
+    if (starts(L"parallels"))            return L"parallels";
+    if (starts(L"ovf"))                  return L"ovf";
+    if (starts(L"apple"))                return L"apple";
+    if (starts(L"vhd disk"))             return L"hyperv";   // .vhd: "VHD disk (Hyper-V / VirtualBox)"
+    if (starts(L"raw disk image"))       return L"generic";
+    if (starts(L"disk image"))           return L"generic";
+    if (starts(L"windows imaging"))      return L"wim";
+    if (starts(L"archive"))              return L"archive";
+    if (starts(L"custom"))               return L"custom";
+    return L"other";
+}
+
+// Normalize a user-supplied vendor token. Returns "" when unknown.
+static std::wstring NormalizeVendor(const std::wstring& in) {
+    std::wstring s = ToLowerW(in);
+    std::wstring r;                        // strip spaces/hyphens: "hyper-v" == "hyperv"
+    for (wchar_t c : s)
+        if (c != L' ' && c != L'\t' && c != L'-') r.push_back(c);
+    if (r.empty()) return L"all";
+    static const wchar_t* known[] = {
+        L"all", L"virtualbox", L"vmware", L"hyperv", L"qemu",
+        L"parallels", L"ovf", L"apple", L"wim", L"generic",
+        L"archive", L"custom", L"other",
+    };
+    for (auto k : known) if (r == k) return r;
+    return L"";                            // unknown
+}
+
+static bool VendorAllowed(const std::wstring& type) {
+    if (g_onlyVendor.empty() || g_onlyVendor == L"all") return true;
+    return VendorOf(type) == g_onlyVendor;
 }
 
 static std::wstring FormatSize(ULONGLONG bytes) {
@@ -290,6 +341,7 @@ static VmMatch MatchVmType(const std::wstring& nameLower, ULONGLONG size) {
 
 static void RecordFinding(Logger& log, const std::wstring& path, ULONGLONG size,
                           const std::wstring& type, bool core) {
+    if (!VendorAllowed(type)) return;   // /only: vendor filter
     g_findings.push_back({ path, ParentDir(path), type, size, core });
     log.Log(L"  [" + type + L"] " + path + L"  (" + FormatSize(size) + L")");
 }
@@ -709,7 +761,8 @@ static std::string CsvEscape(const std::wstring& w) {
 // Requires admin to register machine tasks (schtasks /Create fails otherwise).
 // ---------------------------------------------------------------------------
 static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYes,
-                               const std::wstring& csvPath, const std::wstring& extArg) {
+                               const std::wstring& csvPath, const std::wstring& extArg,
+                               const std::wstring& onlyArg) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L"";
     std::wstring c = L"\"" + std::wstring(exe) + L"\"";
@@ -719,6 +772,7 @@ static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYe
     if (assumeYes) c += L" /yes";
     if (!csvPath.empty()) c += L" /csv:" + csvPath;
     if (!extArg.empty()) c += L" /ext:" + extArg;
+    if (!onlyArg.empty()) c += L" /only:" + onlyArg;
     return c;
 }
 
@@ -747,11 +801,11 @@ static int RunHidden(const wchar_t* app, const wchar_t* args) {
 
 static void ScheduleTask(Logger& log, int day, CleanMode mode, bool assumeYes,
                          bool assumeLicense, const std::wstring& csvPath,
-                         const std::wstring& extArg) {
+                         const std::wstring& extArg, const std::wstring& onlyArg) {
     static const wchar_t* dayNames[] = { L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun" };
     if (day < 1 || day > 7) day = 7;
     std::wstring dn = dayNames[day - 1];
-    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg);
+    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg);
     if (cmd.empty()) { log.Log(L"ERROR: cannot determine executable path."); return; }
     std::wstring schedArgs = L"/create /tn VMCleaner /tr \"" + cmd + L"\" /sc weekly /d " +
                              dn + L" /st 03:30 /f";
@@ -857,6 +911,10 @@ static void PrintLicense(Output& o) {
     o.Print(L" 4. Provided \"as is\", without warranty of any kind.\r\n");
     o.Print(L" 5. The author is not liable for data loss or any\r\n");
     o.Print(L"    damage caused by using this tool.\r\n");
+    o.Print(L"\r\n");
+    o.Print(L" Copyright (c) 2026 Kamil Alta\r\n");
+    o.Print(L" Licensed under CC BY-NC 4.0 (non-commercial use only)\r\n");
+    o.Print(L" https://creativecommons.org/licenses/by-nc/4.0/\r\n");
     o.Print(L"\r\n");
     o.Print(L" DISCLAIMER: This tool is provided \"as is\", without any\r\n");
     o.Print(L"    warranty. The author accepts no liability for data loss,\r\n");
@@ -983,6 +1041,10 @@ static void PrintUsage(Output& out) {
     out.Print(L"  vmcleaner.exe /log:<path>     write log to a specific file\r\n");
     out.Print(L"  vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB)\r\n");
     out.Print(L"  vmcleaner.exe /ext:<a,b,...>  also match these custom file extensions\r\n");
+    out.Print(L"  vmcleaner.exe /only:<vendor>  only report/clean one vendor\r\n");
+    out.Print(L"                              (all, virtualbox, vmware, hyperv, qemu,\r\n");
+    out.Print(L"                               parallels, ovf, apple, generic, archive,\r\n");
+    out.Print(L"                               wim, custom, other) - default all\r\n");
     out.Print(L"  vmcleaner.exe /noregistry     skip registry detection\r\n");
     out.Print(L"  vmcleaner.exe /csv:<path>     also write a CSV report\r\n");
     out.Print(L"                              columns: host,vm,group,type,path,size_bytes,status\r\n");
@@ -1006,6 +1068,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring customPath;
     std::wstring logOverride;
     std::wstring csvOverride;
+    std::wstring onlyVendor;   // /only: normalized vendor id ("" = all / default)
     std::vector<std::wstring> customExts;
     int taskOp = 0; // 0=off(no action)  1..7=register on that day  -1=unregister
 
@@ -1013,8 +1076,9 @@ int wmain(int argc, wchar_t* argv[]) {
         std::wstring a = argv[i];
         if (a.rfind(L"/log:", 0) == 0)                 logOverride = a.substr(5);
         else if (a.rfind(L"/minsize:", 0) == 0) {
-            unsigned v = (unsigned)wcstoul(a.c_str() + 9, nullptr, 10);
-            if (v) g_minArchiveMB = v;
+            wchar_t* end = nullptr;
+            unsigned long v = wcstoul(a.c_str() + 9, &end, 10);
+            if (end && *end == L'\0') g_minArchiveMB = (unsigned int)v;  // 0 = disable archive flagging
         }
         else if (a.rfind(L"/csv:", 0) == 0)            csvOverride = a.substr(5);
         else if (a.rfind(L"/ext:", 0) == 0) {
@@ -1024,6 +1088,18 @@ int wmain(int argc, wchar_t* argv[]) {
                 Output o;
                 o.Print(L"WARNING: /ext:" + a.substr(5) +
                         L" - no valid extension tokens (letters/digits, max 24 chars, comma-separated)\r\n");
+            }
+        }
+        else if (a.rfind(L"/only:", 0) == 0) {
+            std::wstring nv = NormalizeVendor(a.substr(6));
+            if (nv.empty()) {
+                Output o;
+                o.Print(L"WARNING: /only:" + a.substr(6) +
+                        L" - unknown vendor (use: all, virtualbox, vmware, hyperv, qemu, "
+                        L"parallels, ovf, apple, generic, archive, wim, custom, other). "
+                        L"Scanning all vendors.\r\n");
+            } else if (nv != L"all") {
+                onlyVendor = nv;
             }
         }
         else if (a.rfind(L"/task:", 0) == 0) {
@@ -1054,6 +1130,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (i) g_customExtsArg += L",";
         g_customExtsArg += g_customExts[i];
     }
+    g_onlyVendor = onlyVendor;   // vendor filter for the scan
 
     // License must be agreed before any task (scan or cleanup) runs.
     if (!LicenseGate(assumeLicense)) return 2;
@@ -1102,6 +1179,8 @@ int wmain(int argc, wchar_t* argv[]) {
             L" MB (.zip .7z .rar .tar.gz .tgz .tar .gz .bz2 .xz .tbz2 .txz)");
     if (!g_customExts.empty())
         log.Log(L"Custom extensions: " + g_customExtsArg + L" (matched as core VM files)");
+    if (!g_onlyVendor.empty() && g_onlyVendor != L"all")
+        log.Log(L"Vendor filter: only " + g_onlyVendor + L" (other vendors excluded)");
 
     if (!customPath.empty()) {
         log.Log(L"Target path: " + customPath);
@@ -1134,7 +1213,7 @@ int wmain(int argc, wchar_t* argv[]) {
     log.Log(L"Scan finished: " + NowStamp());
     PrintGroupedReport(log);
 
-    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg);
+    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor);
 
     int failed = 0;
     if (mode != CleanMode::None)
