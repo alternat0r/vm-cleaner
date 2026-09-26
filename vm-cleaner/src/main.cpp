@@ -89,6 +89,11 @@ static std::wstring ToLowerW(const std::wstring& s) {
     return r;
 }
 
+// 64-bit FILETIME value (u64), from a FILETIME or a WIN32_FILE_ATTRIBUTE_DATA.
+static ULONGLONG Ftime64(const FILETIME& ft) {
+    return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
 static std::string ToUtf8(const std::wstring& w) {
     if (w.empty()) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -145,6 +150,7 @@ static int ParseCustomExts(const std::wstring& value, std::vector<std::wstring>&
 // means no filtering (the default).
 // ---------------------------------------------------------------------------
 static std::wstring g_onlyVendor; // normalized vendor id, or "all"
+static ULONGLONG g_maxAgeDays = 0; // /maxage: protect folders modified within N days (0 = off)
 
 static std::wstring VendorOf(const std::wstring& type) {
     std::wstring t = ToLowerW(type);
@@ -308,6 +314,7 @@ struct Finding {
     std::wstring type;
     ULONGLONG    size;
     bool         core;
+    ULONGLONG    mtime; // last write time as FILETIME (u64)
 };
 static std::vector<Finding> g_findings;
 static ULONGLONG g_dirsScanned = 0;
@@ -340,9 +347,9 @@ static VmMatch MatchVmType(const std::wstring& nameLower, ULONGLONG size) {
 }
 
 static void RecordFinding(Logger& log, const std::wstring& path, ULONGLONG size,
-                          const std::wstring& type, bool core) {
+                          const std::wstring& type, bool core, ULONGLONG mtime = 0) {
     if (!VendorAllowed(type)) return;   // /only: vendor filter
-    g_findings.push_back({ path, ParentDir(path), type, size, core });
+    g_findings.push_back({ path, ParentDir(path), type, size, core, mtime });
     log.Log(L"  [" + type + L"] " + path + L"  (" + FormatSize(size) + L")");
 }
 
@@ -387,7 +394,7 @@ static void ScanDirectory(const std::wstring& dir, Logger& log, bool isRoot) {
             if (size == 0) continue; // skip empty placeholder/breadcrumb files
             VmMatch m = MatchVmType(ToLowerW(name), size);
             if (!m.type.empty())
-                RecordFinding(log, Join(dir, name), size, m.type, m.core);
+                RecordFinding(log, Join(dir, name), size, m.type, m.core, Ftime64(fd.ftLastWriteTime));
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -695,6 +702,56 @@ static void PrintGroupedReport(Logger& log) {
 }
 
 // ---------------------------------------------------------------------------
+// Age filter (/maxage:<days>). Folder-level: a VM folder is protected while
+// ANY of its files was modified within the last N days - so a VM still in use
+// is never partially cleaned. All findings in protected folders are logged
+// and removed (grouping, cleanup and CSV then ignore them). 0 disables.
+// ---------------------------------------------------------------------------
+static void ApplyAgeFilter(Logger& log) {
+    ULONGLONG days = g_maxAgeDays;
+    if (days == 0) return;
+
+    // newest last-write time per folder
+    std::map<std::wstring, ULONGLONG> newest;
+    for (const auto& f : g_findings)
+        if (f.mtime > newest[f.dir]) newest[f.dir] = f.mtime;
+
+    // FILETIME (100ns ticks since 1601) -> seconds, relative to now
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    ULONGLONG now64 = Ftime64(now);
+    const ULONGLONG tickPerSec = 10000000ULL;
+    ULONGLONG cutoffAgeSec = days * 24 * 60 * 60;
+
+    // folders whose newest file is still within the cutoff are protected
+    std::set<std::wstring> protectedDirs;
+    for (const auto& kv : newest) {
+        ULONGLONG ft64 = kv.second;
+        if (ft64 < now64) {
+            ULONGLONG ageSec = (now64 - ft64) / tickPerSec;
+            if (ageSec < cutoffAgeSec) protectedDirs.insert(kv.first);
+        }
+    }
+    if (protectedDirs.empty()) return;
+
+    size_t kept = 0, excluded = 0;
+    std::vector<Finding> nf;
+    nf.reserve(g_findings.size());
+    for (const auto& f : g_findings) {
+        if (protectedDirs.count(f.dir)) { excluded++; continue; }
+        nf.push_back(f);
+        kept++;
+    }
+    for (const auto& d : protectedDirs)
+        log.Log(L"  [skipped] " + d + L"  (modified within " +
+                std::to_wstring(days) + L" day(s) - protected by /maxage)");
+    log.Log(L"Age filter: " + std::to_wstring(kept) + L" file(s) kept, " +
+            std::to_wstring(excluded) + L" file(s) excluded in " +
+            std::to_wstring(protectedDirs.size()) + L" folder(s)");
+    g_findings = std::move(nf);
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup: recycle bin or hard delete
 // ---------------------------------------------------------------------------
 enum class CleanMode { None, Recycle, Delete };
@@ -762,7 +819,7 @@ static std::string CsvEscape(const std::wstring& w) {
 // ---------------------------------------------------------------------------
 static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYes,
                                const std::wstring& csvPath, const std::wstring& extArg,
-                               const std::wstring& onlyArg) {
+                               const std::wstring& onlyArg, unsigned long long maxAgeDays) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L"";
     std::wstring c = L"\"" + std::wstring(exe) + L"\"";
@@ -773,6 +830,7 @@ static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYe
     if (!csvPath.empty()) c += L" /csv:" + csvPath;
     if (!extArg.empty()) c += L" /ext:" + extArg;
     if (!onlyArg.empty()) c += L" /only:" + onlyArg;
+    if (maxAgeDays > 0) c += L" /maxage:" + std::to_wstring(maxAgeDays);
     return c;
 }
 
@@ -801,11 +859,12 @@ static int RunHidden(const wchar_t* app, const wchar_t* args) {
 
 static void ScheduleTask(Logger& log, int day, CleanMode mode, bool assumeYes,
                          bool assumeLicense, const std::wstring& csvPath,
-                         const std::wstring& extArg, const std::wstring& onlyArg) {
+                         const std::wstring& extArg, const std::wstring& onlyArg,
+                         unsigned long long maxAgeDays) {
     static const wchar_t* dayNames[] = { L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun" };
     if (day < 1 || day > 7) day = 7;
     std::wstring dn = dayNames[day - 1];
-    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg);
+    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg, maxAgeDays);
     if (cmd.empty()) { log.Log(L"ERROR: cannot determine executable path."); return; }
     std::wstring schedArgs = L"/create /tn VMCleaner /tr \"" + cmd + L"\" /sc weekly /d " +
                              dn + L" /st 03:30 /f";
@@ -1045,6 +1104,8 @@ static void PrintUsage(Output& out) {
     out.Print(L"                              (all, virtualbox, vmware, hyperv, qemu,\r\n");
     out.Print(L"                               parallels, ovf, apple, generic, archive,\r\n");
     out.Print(L"                               wim, custom, other) - default all\r\n");
+    out.Print(L"  vmcleaner.exe /maxage:<days>  ignore VM folders modified within the last\r\n");
+    out.Print(L"                              N days (protects active VMs; default off)\r\n");
     out.Print(L"  vmcleaner.exe /noregistry     skip registry detection\r\n");
     out.Print(L"  vmcleaner.exe /csv:<path>     also write a CSV report\r\n");
     out.Print(L"                              columns: host,vm,group,type,path,size_bytes,status\r\n");
@@ -1069,6 +1130,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring logOverride;
     std::wstring csvOverride;
     std::wstring onlyVendor;   // /only: normalized vendor id ("" = all / default)
+    unsigned long long maxAgeDays = 0; // /maxage: days (0 = filter off)
     std::vector<std::wstring> customExts;
     int taskOp = 0; // 0=off(no action)  1..7=register on that day  -1=unregister
 
@@ -1102,6 +1164,18 @@ int wmain(int argc, wchar_t* argv[]) {
                 onlyVendor = nv;
             }
         }
+        else if (a.rfind(L"/maxage:", 0) == 0) {
+            wchar_t* start = (wchar_t*)a.c_str() + 8;
+            wchar_t* end = nullptr;
+            unsigned long long d = wcstoull(start, &end, 10);
+            if (end && *end == L'\0' && end > start && d <= 3650)
+                maxAgeDays = d;
+            else {
+                Output o;
+                o.Print(L"WARNING: /maxage:" + a.substr(8) +
+                        L" - invalid day count (use 0-3650). Age filter disabled.\r\n");
+            }
+        }
         else if (a.rfind(L"/task:", 0) == 0) {
             std::wstring d = ToLowerW(a.substr(6));
             if (d == L"off") taskOp = -1;
@@ -1131,6 +1205,7 @@ int wmain(int argc, wchar_t* argv[]) {
         g_customExtsArg += g_customExts[i];
     }
     g_onlyVendor = onlyVendor;   // vendor filter for the scan
+    g_maxAgeDays = (ULONGLONG)maxAgeDays;
 
     // License must be agreed before any task (scan or cleanup) runs.
     if (!LicenseGate(assumeLicense)) return 2;
@@ -1181,6 +1256,9 @@ int wmain(int argc, wchar_t* argv[]) {
         log.Log(L"Custom extensions: " + g_customExtsArg + L" (matched as core VM files)");
     if (!g_onlyVendor.empty() && g_onlyVendor != L"all")
         log.Log(L"Vendor filter: only " + g_onlyVendor + L" (other vendors excluded)");
+    if (g_maxAgeDays > 0)
+        log.Log(L"Age filter: protect folders modified within the last " +
+                std::to_wstring(g_maxAgeDays) + L" day(s)");
 
     if (!customPath.empty()) {
         log.Log(L"Target path: " + customPath);
@@ -1194,13 +1272,14 @@ int wmain(int argc, wchar_t* argv[]) {
         } else if (attr != INVALID_FILE_ATTRIBUTES) {
             WIN32_FILE_ATTRIBUTE_DATA fad;
             ULONGLONG size = 0;
-            if (GetFileAttributesExW(customPath.c_str(), GetFileExInfoStandard, &fad))
+            if (GetFileAttributesExW(customPath.c_str(), GetFileExInfoStandard, &fad)) {
                 size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
-            VmMatch m = MatchVmType(ToLowerW(customPath), size);
-            if (!m.type.empty())
-                RecordFinding(log, customPath, size, m.type, m.core);
-            else
-                log.Log(L"  (not a VM image file)");
+                VmMatch m = MatchVmType(ToLowerW(customPath), size);
+                if (!m.type.empty())
+                    RecordFinding(log, customPath, size, m.type, m.core, Ftime64(fad.ftLastWriteTime));
+                else
+                    log.Log(L"  (not a VM image file)");
+            }
         } else {
             log.Log(L"ERROR: path not found: " + customPath);
         }
@@ -1211,9 +1290,10 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     log.Log(L"Scan finished: " + NowStamp());
+    ApplyAgeFilter(log);
     PrintGroupedReport(log);
 
-    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor);
+    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor, maxAgeDays);
 
     int failed = 0;
     if (mode != CleanMode::None)

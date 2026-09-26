@@ -40,6 +40,7 @@ version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
     vmcleaner.exe /minsize:<MB>   archive size threshold (default 200 MB; 0 = never flag archives)
     vmcleaner.exe /ext:<a,b,...>  also match these custom file extensions
     vmcleaner.exe /only:<vendor>  only report/clean one vendor (see Vendor filter)
+    vmcleaner.exe /maxage:<days>  protect VM folders modified within the last N days
     vmcleaner.exe /noregistry     skip registry detection
     vmcleaner.exe /csv:<path>     also write a CSV report
     vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)
@@ -136,6 +137,14 @@ Example: `vmcleaner.exe /only:vmware /recycle` touches only VMware files.
 Note: `.vhd`/`.vhdx` are classified as Hyper-V. `.nvram` carries the label
 "VMware/QEMU (NVRAM)" and therefore classifies to the **vmware** bucket, so
 `/only:qemu` excludes it.
+
+Age filter: `/maxage:<days>` protects VM folders that were modified recently.
+A folder (any of its files) with a last-write time within the last N days is
+excluded from the report, cleanup, and CSV; the exclusion is logged. Default
+is off (`0`). Invalid values (non-numeric, > 3650) print a warning and leave
+the filter off. This is the safety net for unattended fleet runs — e.g.
+`vmcleaner.exe /delete /yes /maxage:7` never touches a VM used within the
+last week. Carries over into a self-scheduled `/task`.
 
 ## Report
 
