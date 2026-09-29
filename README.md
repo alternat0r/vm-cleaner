@@ -5,6 +5,10 @@ hypervisor (VirtualBox, VMware, Hyper-V, QEMU/KVM, Parallels, ...) across all
 local drives and the registry, groups them per-VM, reports reclaimable space,
 and can recycle or delete them. Writes a timestamped log.
 
+## TL;DR
+
+    vmcleaner.exe /alldrives /accept /delete /log:vmcleaner.log
+
 ## Use case
 
 Designed for bulk cleanup of shared / multi-seat machines — training rooms,
