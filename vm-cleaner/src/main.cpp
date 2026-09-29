@@ -151,6 +151,23 @@ static int ParseCustomExts(const std::wstring& value, std::vector<std::wstring>&
 // ---------------------------------------------------------------------------
 static std::wstring g_onlyVendor; // normalized vendor id, or "all"
 static ULONGLONG g_maxAgeDays = 0; // /maxage: protect folders modified within N days (0 = off)
+static bool g_includeCloud = false; // /cloud: include dehydrated cloud placeholders (off by default)
+
+// FILE_ATTRIBUTE_RECALL_ON_* mark a dehydrated cloud placeholder (OneDrive/
+// Dropbox "Files On-Demand"): the directory entry reports the FULL remote
+// size, but little or nothing is stored on local disk, and opening/deleting
+// it can trigger a re-download or a cloud-side delete. Older SDKs may not
+// define these constants.
+#ifndef FILE_ATTRIBUTE_RECALL_ON_OPEN
+#define FILE_ATTRIBUTE_RECALL_ON_OPEN 0x00040000
+#endif
+#ifndef FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+#define FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS 0x00400000
+#endif
+
+static bool IsCloudPlaceholder(DWORD attrs) {
+    return (attrs & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) != 0;
+}
 
 static std::wstring VendorOf(const std::wstring& type) {
     std::wstring t = ToLowerW(type);
@@ -315,6 +332,7 @@ struct Finding {
     ULONGLONG    size;
     bool         core;
     ULONGLONG    mtime; // last write time as FILETIME (u64)
+    bool         cloud; // dehydrated cloud placeholder (OneDrive/Dropbox "Files On-Demand")
 };
 static std::vector<Finding> g_findings;
 static ULONGLONG g_dirsScanned = 0;
@@ -347,10 +365,12 @@ static VmMatch MatchVmType(const std::wstring& nameLower, ULONGLONG size) {
 }
 
 static void RecordFinding(Logger& log, const std::wstring& path, ULONGLONG size,
-                          const std::wstring& type, bool core, ULONGLONG mtime = 0) {
+                          const std::wstring& type, bool core, ULONGLONG mtime = 0,
+                          bool cloud = false) {
     if (!VendorAllowed(type)) return;   // /only: vendor filter
-    g_findings.push_back({ path, ParentDir(path), type, size, core, mtime });
-    log.Log(L"  [" + type + L"] " + path + L"  (" + FormatSize(size) + L")");
+    g_findings.push_back({ path, ParentDir(path), type, size, core, mtime, cloud });
+    log.Log(L"  [" + type + L"] " + path + L"  (" + FormatSize(size) + L")" +
+            (cloud ? L"  [cloud placeholder - not stored locally]" : L""));
 }
 
 static bool IsSkipDir(const std::wstring& lower, bool isRoot) {
@@ -394,7 +414,8 @@ static void ScanDirectory(const std::wstring& dir, Logger& log, bool isRoot) {
             if (size == 0) continue; // skip empty placeholder/breadcrumb files
             VmMatch m = MatchVmType(ToLowerW(name), size);
             if (!m.type.empty())
-                RecordFinding(log, Join(dir, name), size, m.type, m.core, Ftime64(fd.ftLastWriteTime));
+                RecordFinding(log, Join(dir, name), size, m.type, m.core,
+                             Ftime64(fd.ftLastWriteTime), IsCloudPlaceholder(fd.dwFileAttributes));
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -702,6 +723,32 @@ static void PrintGroupedReport(Logger& log) {
 }
 
 // ---------------------------------------------------------------------------
+// Cloud filter (default on; /cloud opts in). File-level: a dehydrated cloud
+// placeholder reports its full remote size but occupies little or no local
+// disk, and deleting/recycling it can trigger a re-download or delete the
+// cloud copy - not just free local space. Excluded findings are logged and
+// removed (report, cleanup and CSV then ignore them), same as /maxage.
+// ---------------------------------------------------------------------------
+static void ApplyCloudFilter(Logger& log) {
+    if (g_includeCloud) return;
+
+    size_t kept = 0, excluded = 0;
+    ULONGLONG excludedBytes = 0;
+    std::vector<Finding> nf;
+    nf.reserve(g_findings.size());
+    for (const auto& f : g_findings) {
+        if (f.cloud) { excluded++; excludedBytes += f.size; continue; }
+        nf.push_back(f);
+        kept++;
+    }
+    if (excluded == 0) return;
+    log.Log(L"Cloud filter: " + std::to_wstring(kept) + L" file(s) kept, " +
+            std::to_wstring(excluded) + L" cloud placeholder(s) excluded (" +
+            FormatSize(excludedBytes) + L" claimed remotely, not local - pass /cloud to include)");
+    g_findings = std::move(nf);
+}
+
+// ---------------------------------------------------------------------------
 // Age filter (/maxage:<days>). Folder-level: a VM folder is protected while
 // ANY of its files was modified within the last N days - so a VM still in use
 // is never partially cleaned. All findings in protected folders are logged
@@ -821,7 +868,7 @@ static std::string CsvEscape(const std::wstring& w) {
 static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYes,
                                const std::wstring& csvPath, const std::wstring& extArg,
                                const std::wstring& onlyArg, unsigned long long maxAgeDays,
-                               const std::wstring& path, bool allDrives) {
+                               const std::wstring& path, bool allDrives, bool includeCloud) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L"";
     std::wstring c = L"\"" + std::wstring(exe) + L"\"";
@@ -833,6 +880,7 @@ static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYe
     if (!extArg.empty()) c += L" /ext:" + extArg;
     if (!onlyArg.empty()) c += L" /only:" + onlyArg;
     if (maxAgeDays > 0) c += L" /maxage:" + std::to_wstring(maxAgeDays);
+    if (includeCloud) c += L" /cloud";
     if (!path.empty()) c += L" \"" + path + L"\"";
     else if (mode != CleanMode::None && allDrives) c += L" /alldrives";
     return c;
@@ -923,11 +971,11 @@ static void ScheduleTask(Logger& log, int day, CleanMode mode, bool assumeYes,
                          bool assumeLicense, const std::wstring& csvPath,
                          const std::wstring& extArg, const std::wstring& onlyArg,
                          unsigned long long maxAgeDays, const std::wstring& path,
-                         bool allDrives) {
+                         bool allDrives, bool includeCloud) {
     static const wchar_t* dayNames[] = { L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun" };
     if (day < 1 || day > 7) day = 7;
     std::wstring dn = dayNames[day - 1];
-    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg, maxAgeDays, path, allDrives);
+    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg, maxAgeDays, path, allDrives, includeCloud);
     if (cmd.empty()) { log.Log(L"ERROR: cannot determine executable path."); return; }
     std::wstring schedArgs = L"/create /tn VMCleaner /tr \"" + cmd + L"\" /sc weekly /d " +
                              dn + L" /st 03:30 /f";
@@ -1246,6 +1294,11 @@ static void PrintUsage(Output& out) {
     out.Print(L"                               wim, custom, other) - default all\r\n");
     out.Print(L"  vmcleaner.exe /maxage:<days>  ignore VM folders modified within the last\r\n");
     out.Print(L"                              N days (protects active VMs; default off)\r\n");
+    out.Print(L"  vmcleaner.exe /cloud          include dehydrated cloud placeholders (OneDrive/\r\n");
+    out.Print(L"                              Dropbox Files On-Demand) in the report and cleanup;\r\n");
+    out.Print(L"                              excluded by default (they report full remote size\r\n");
+    out.Print(L"                              but aren't stored locally, and deleting them can\r\n");
+    out.Print(L"                              trigger a re-download or a cloud-side delete)\r\n");
     out.Print(L"  vmcleaner.exe /noregistry     skip registry detection\r\n");
     out.Print(L"  vmcleaner.exe /csv:<path>     also write a CSV report\r\n");
     out.Print(L"                              columns: host,vm,group,type,path,size_bytes,status\r\n");
@@ -1340,6 +1393,7 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (a == L"/yes" || a == L"--yes" || a == L"-y") assumeYes = true;
         else if (a == L"/accept" || a == L"--accept")        assumeLicense = true;
         else if (a == L"/alldrives" || a == L"--alldrives")  alldrives = true;
+        else if (a == L"/cloud" || a == L"--cloud")           g_includeCloud = true;
         else if (a == L"/?" || a == L"--help" || a == L"-h" || a == L"-help") {
             Output o; PrintUsage(o); return 0;
         }
@@ -1459,6 +1513,8 @@ int wmain(int argc, wchar_t* argv[]) {
     if (g_maxAgeDays > 0)
         log.Log(L"Age filter: protect folders modified within the last " +
                 std::to_wstring(g_maxAgeDays) + L" day(s)");
+    if (g_includeCloud)
+        log.Log(L"Cloud filter: disabled (/cloud) - dehydrated cloud placeholders are included");
 
     if (!customPath.empty()) {
         log.Log(L"Target path: " + customPath);
@@ -1476,7 +1532,8 @@ int wmain(int argc, wchar_t* argv[]) {
                 size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
                 VmMatch m = MatchVmType(ToLowerW(customPath), size);
                 if (!m.type.empty())
-                    RecordFinding(log, customPath, size, m.type, m.core, Ftime64(fad.ftLastWriteTime));
+                    RecordFinding(log, customPath, size, m.type, m.core,
+                                 Ftime64(fad.ftLastWriteTime), IsCloudPlaceholder(fad.dwFileAttributes));
                 else
                     log.Log(L"  (not a VM image file)");
             }
@@ -1490,10 +1547,11 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     log.Log(L"Scan finished: " + NowStamp());
+    ApplyCloudFilter(log);
     ApplyAgeFilter(log);
     PrintGroupedReport(log);
 
-    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor, maxAgeDays, customPath, alldrives);
+    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor, maxAgeDays, customPath, alldrives, g_includeCloud);
 
     int failed = 0;
     if (mode != CleanMode::None)

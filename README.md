@@ -43,6 +43,7 @@ version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
     vmcleaner.exe /ext:<a,b,...>  also match these custom file extensions
     vmcleaner.exe /only:<vendor>  only report/clean one vendor (see Vendor filter)
     vmcleaner.exe /maxage:<days>  protect VM folders modified within the last N days
+    vmcleaner.exe /cloud          include dehydrated cloud placeholders (excluded by default)
     vmcleaner.exe /noregistry     skip registry detection
     vmcleaner.exe /csv:<path>     also write a CSV report
     vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)
@@ -177,6 +178,15 @@ is off (`0`). Invalid values (non-numeric, > 3650) print a warning and leave
 the filter off. This is the safety net for unattended fleet runs — e.g.
 `vmcleaner.exe /delete /yes /maxage:7` never touches a VM used within the
 last week. Carries over into a self-scheduled `/task`.
+
+Cloud filter: dehydrated cloud placeholders (OneDrive / Dropbox "Files
+On-Demand") are excluded by default. A placeholder's directory entry reports
+its full remote size even though little or nothing is stored on local disk,
+so counting it would overstate reclaimable space — and recycling/deleting it
+can trigger a re-download or delete the cloud copy instead of just freeing
+local disk. Excluded files are logged individually and summarized, and are
+left out of the report, cleanup, and CSV, same as `/maxage`. Pass `/cloud` to
+include them anyway. Carries over into a self-scheduled `/task`.
 
 ## Report
 
