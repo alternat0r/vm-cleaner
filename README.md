@@ -16,11 +16,9 @@ corrupted.
 
 ## License
 
-Copyright (c) 2026 Kamil Alta. VM Cleaner is licensed under the Creative
-Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0) —
-see [`LICENSE`](LICENSE). You may copy and redistribute the code and release
-binary for **non-commercial** purposes with attribution. Commercial use
-requires separate permission.
+VM Cleaner is licensed under the GNU General Public License v3.0 (GPL-3.0) —
+see [`LICENSE`](LICENSE). You are free to copy, redistribute, and modify the
+code and release binary, commercial or otherwise, under the terms of the GPL.
 
 ## Build
 
@@ -45,13 +43,15 @@ version on every build (build number resets to 0), e.g. `1.1.0` → `1.2.0`.
     vmcleaner.exe /csv:<path>     also write a CSV report
     vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)
     vmcleaner.exe /task:off      remove the self-scheduled task
+    vmcleaner.exe /task:status   show the self-scheduled task (read-only audit)
+    vmcleaner.exe /alldrives     required for unscoped /recycle or /delete (all drives)
 
 Examples:
 
     vmcleaner.exe                      # find everything, change nothing
-    vmcleaner.exe /delete              # prompt, then delete on "YES"
+    vmcleaner.exe /alldrives /delete   # unscoped: confirm all-drives, then type YES
     vmcleaner.exe D:\VMs /recycle /yes # recycle a folder, no prompt
-    vmcleaner.exe /recycle /yes /accept /csv:C:\fleet\results.csv   # unattended + report
+    vmcleaner.exe /alldrives /recycle /yes /accept /csv:C:\fleet\r.csv  # fleet
 
 ## Fleet mode (unattended)
 
@@ -62,6 +62,12 @@ For deploying across many machines without interaction:
 
       vmcleaner.exe /accept /recycle /yes
 
+  With no path this is a **full all-drives cleanup**, so the safety guard
+  requires you to acknowledge it — add `/alldrives` to the command line
+  (see *Safety* below):
+
+      vmcleaner.exe /accept /alldrives /recycle /yes
+
 - `/csv:<path>` — machine-readable report, one row per finding:
   `host,vm,group,type,path,size_bytes,status` where `status` is
   `found` (dry run), `recycled`, `deleted`, `skipped_in_use`, or `failed`.
@@ -71,13 +77,35 @@ For deploying across many machines without interaction:
   flags, so machines clean themselves on a schedule. `/task:off` removes it.
   Registering machine tasks needs an elevated prompt; the tool reports
   failure gracefully otherwise.
+- `/task:status` — read-only audit of the `VMCleaner` task: prints its run
+  command (including any `/only:`/`/maxage:`/`/ext:`/`/csv:` it carries),
+  schedule, and next run time. No admin rights and no license agreement
+  needed (it touches nothing), so it works on unlicensed fleet machines.
+  Exit code `1` when the task is not registered, `0` when it is — handy for
+  fleet scripts that verify the schedule was applied.
 - Exit codes: `0` ok, `1` error, `2` license declined, `3` cleanup had
   failure(s) — convenient for batch files and remote scripts.
+## Safety
+
+- **All-drives guard (`/alldrives`).** With no path, `/recycle` and `/delete`
+  scan and clean **every** drive. Because that is easy to mistype and can
+  remove data that merely *looks* like a VM image, the tool refuses to run
+  it unacknowledged: it prints a prominent warning and requires you to type
+  `ALDRIVES` at the prompt, or to pass `/alldrives` on the command line
+  (needed for unattended fleet runs and scheduled tasks). A scoped run with
+  a path is unaffected and still needs no acknowledgement. If the guard
+  fires in a scheduled task, the run aborts cleanly (nothing is deleted) —
+  a visible, safe failure rather than a silent sweep.
+- `/delete` is **permanent**; prefer `/recycle` (recoverable via the Recycle
+  Bin) unless you specifically need it gone.
 - `/delete` always prints a **warning + disclaimer** before deleting
   (console and log, even with `/yes`). When the process is **not elevated**,
   an extra admin warning is printed — files in system-protected locations
   (e.g. `C:\ProgramData`) or owned by other users require administrator
   rights and will otherwise fail to delete. Run elevated for full coverage.
+- `/maxage:<days>` (see *Age filter*) is an extra safety net for unattended
+  runs: it skips VM folders modified within the last N days, so an active
+  VM is never touched.
 
 ## License gate
 

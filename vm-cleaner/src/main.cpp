@@ -1,7 +1,7 @@
 // vm-cleaner.cpp — find VM disk images (any vendor) across drives + registry, log results,
 // group them per-VM, and optionally recycle/delete them.
 // Builds with MSVC 2022 (/MT static, Unicode). No external dependencies.
-// Copyright (c) 2026 Kamil Alta. Licensed under CC BY-NC 4.0 (see LICENSE).
+// Licensed under the GNU General Public License v3.0 (see LICENSE).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -814,12 +814,14 @@ static std::string CsvEscape(const std::wstring& w) {
 // exe with the same cleanup flags (fleet deployment without external tools).
 //   /task        register weekly (Sundays 03:30, interactive or not, on AC+bat)
 //   /task:<day>  register weekly on the given day (mon..sun or 1..7)
+//   /task:status show the registered task (read-only, no admin/license)
 //   /task:off    unregister
 // Requires admin to register machine tasks (schtasks /Create fails otherwise).
 // ---------------------------------------------------------------------------
 static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYes,
                                const std::wstring& csvPath, const std::wstring& extArg,
-                               const std::wstring& onlyArg, unsigned long long maxAgeDays) {
+                               const std::wstring& onlyArg, unsigned long long maxAgeDays,
+                               const std::wstring& path, bool allDrives) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return L"";
     std::wstring c = L"\"" + std::wstring(exe) + L"\"";
@@ -831,6 +833,8 @@ static std::wstring TaskRunCmd(bool assumeLicense, CleanMode mode, bool assumeYe
     if (!extArg.empty()) c += L" /ext:" + extArg;
     if (!onlyArg.empty()) c += L" /only:" + onlyArg;
     if (maxAgeDays > 0) c += L" /maxage:" + std::to_wstring(maxAgeDays);
+    if (!path.empty()) c += L" \"" + path + L"\"";
+    else if (mode != CleanMode::None && allDrives) c += L" /alldrives";
     return c;
 }
 
@@ -857,14 +861,73 @@ static int RunHidden(const wchar_t* app, const wchar_t* args) {
     return (int)rc;
 }
 
+// Same as RunHidden, but captures the helper's stdout into out. Uses a temp
+// file (not an anonymous pipe): a pipe can deadlock if a grandchild inherits
+// the write end and holds it open after the direct child exits, whereas a
+// file is read only after the child has fully terminated. Returns the exit
+// code, -1 = not found, -2 = launch failed.
+static int RunCapture(const wchar_t* app, const wchar_t* args, std::wstring& out) {
+    out.clear();
+    wchar_t appPath[MAX_PATH];
+    if (!SearchPathW(nullptr, app, nullptr, MAX_PATH, appPath, nullptr))
+        return -1;
+    std::wstring cl = std::wstring(appPath) + L" " + args;
+    std::vector<wchar_t> cmd(cl.begin(), cl.end());
+    cmd.push_back(L'\0');
+
+    wchar_t tmpdir[MAX_PATH], tmp[MAX_PATH + 64];
+    GetTempPathW(MAX_PATH, tmpdir);
+    wsprintf(tmp, L"%shc_%.4x_%.4x.bin", tmpdir,
+             (unsigned)GetCurrentProcessId(), (unsigned)GetTickCount());
+    HANDLE hf = CreateFileW(tmp, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return -2;
+    SetHandleInformation(hf, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    HANDLE hNul = CreateFileW(L"NUL", 0, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+
+    STARTUPINFOW si = {}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hf; si.hStdError = hf;
+    si.hStdInput = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(hf); if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+        DeleteFileW(tmp);
+        return -2;
+    }
+    CloseHandle(hf);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
+    // Wait for the child to fully exit BEFORE reading, then read the file.
+    WaitForSingleObject(pi.hProcess, 30000);
+    DWORD rc = 0; GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+
+    HANDLE r = CreateFileW(tmp, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (r != INVALID_HANDLE_VALUE) {
+        std::string bytes; char b[8192]; DWORD n;
+        while (ReadFile(r, b, sizeof(b), &n, nullptr) && n > 0) bytes.append(b, n);
+        CloseHandle(r);
+        int wl = MultiByteToWideChar(CP_OEMCP, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+        if (wl > 0) {
+            out.resize((size_t)wl);
+            MultiByteToWideChar(CP_OEMCP, 0, bytes.data(), (int)bytes.size(), &out[0], wl);
+        }
+    }
+    DeleteFileW(tmp);
+    return (int)rc;
+}
+
 static void ScheduleTask(Logger& log, int day, CleanMode mode, bool assumeYes,
                          bool assumeLicense, const std::wstring& csvPath,
                          const std::wstring& extArg, const std::wstring& onlyArg,
-                         unsigned long long maxAgeDays) {
+                         unsigned long long maxAgeDays, const std::wstring& path,
+                         bool allDrives) {
     static const wchar_t* dayNames[] = { L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun" };
     if (day < 1 || day > 7) day = 7;
     std::wstring dn = dayNames[day - 1];
-    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg, maxAgeDays);
+    std::wstring cmd = TaskRunCmd(assumeLicense, mode, assumeYes, csvPath, extArg, onlyArg, maxAgeDays, path, allDrives);
     if (cmd.empty()) { log.Log(L"ERROR: cannot determine executable path."); return; }
     std::wstring schedArgs = L"/create /tn VMCleaner /tr \"" + cmd + L"\" /sc weekly /d " +
                              dn + L" /st 03:30 /f";
@@ -893,6 +956,84 @@ static void UnscheduleTask(Logger& log) {
         log.Log(L"  Task 'VMCleaner' removed.");
     else
         log.Log(L"  No 'VMCleaner' task found (or not admin).");
+}
+
+// ---------------------------------------------------------------------------
+// /task:status - read-only fleet audit of the self-scheduled task (no admin
+// required). Prints the task's run command, schedule and next run, or a clear
+// "not registered" line. Uses schtasks /xml (locale-stable tag names) for the
+// definition and /fo CSV (locale-stable English headers) for the next run.
+// Returns 1 when the task is not registered (useful for fleet scripts).
+// ---------------------------------------------------------------------------
+static int StatusTask(Logger& log) {
+    std::wstring xml;
+    int rc = RunCapture(L"schtasks.exe", L"/query /tn VMCleaner /xml", xml);
+    if (rc != 0) {
+        log.Log(L"  Task 'VMCleaner' is NOT registered (vmcleaner.exe /task[=<day>] to create it).");
+        return 1;
+    }
+    auto tag = [&](const wchar_t* t) -> std::wstring {
+        std::wstring tn = t;
+        std::wstring open = L"<" + tn + L">", close = L"</" + tn + L">";
+        size_t a = xml.find(open);
+        if (a == std::wstring::npos) return L"";
+        a += open.size();
+        size_t b = xml.find(close, a);
+        if (b == std::wstring::npos) return L"";
+        return xml.substr(a, b - a);
+    };
+    std::wstring cmd  = tag(L"Command");
+    std::wstring args = tag(L"Arguments");
+    std::wstring when = tag(L"StartBoundary");
+    std::wstring wd   = tag(L"WorkingDirectory");
+    log.Log(L"  Task 'VMCleaner': registered");
+    if (!cmd.empty())
+        log.Log(L"  Run: " + cmd + (args.empty() ? L"" : L" " + args));
+    if (!when.empty())
+        log.Log(L"  Schedule: weekly @ " + when.substr(11, 5) +
+                L" (ISO " + when + L")");
+    if (!wd.empty())
+        log.Log(L"  Working dir: " + wd);
+
+    // /fo CSV: header row is fixed English; field 2 of the data row is the
+    // next run time. Values are locale-formatted but the position is stable.
+    std::wstring csv;
+    int rc2 = RunCapture(L"schtasks.exe", L"/query /tn VMCleaner /fo CSV", csv);
+    if (rc2 == 0) {
+        // Two lines: header ("Task Name,Next Run Time,Status") + data row.
+        // Take the second line; split on commas (fields may be quoted).
+        std::wstring row;
+        size_t nl1 = csv.find(L'\n');
+        if (nl1 != std::wstring::npos) {
+            size_t nl2 = csv.find(L'\n', nl1 + 1);
+            row = csv.substr(nl1 + 1, (nl2 == std::wstring::npos ? csv.size() : nl2) - nl1 - 1);
+        } else {
+            row = csv; // single line (defensive)
+        }
+        // strip trailing CR
+        while (!row.empty() && (row.back() == L'\r' || row.back() == L'\n')) row.pop_back();
+        if (!row.empty()) {
+            std::vector<std::wstring> f;
+            std::wstring cur;
+            bool inQ = false;
+            for (size_t i = 0; i < row.size(); i++) {
+                wchar_t ch = row[i];
+                if (inQ) {
+                    if (ch == L'"') {
+                        if (i + 1 < row.size() && row[i + 1] == L'"') { cur += L'"'; i++; }
+                        else inQ = false;
+                    } else cur += ch;
+                } else if (ch == L'"') inQ = true;
+                else if (ch == L',') { f.push_back(cur); cur.clear(); }
+                else cur += ch;
+            }
+            f.push_back(cur);
+            // fields: 0=TaskName, 1=Next Run Time, 2=Status
+            if (f.size() >= 2 && f[1].size() > 3 && f[1] != L"N/A")
+                log.Log(L"  Next run: " + f[1]);
+        }
+    }
+    return 0;
 }
 
 static bool WriteCsvReport(const std::wstring& csvPath, Logger& log) {
@@ -971,9 +1112,8 @@ static void PrintLicense(Output& o) {
     o.Print(L" 5. The author is not liable for data loss or any\r\n");
     o.Print(L"    damage caused by using this tool.\r\n");
     o.Print(L"\r\n");
-    o.Print(L" Copyright (c) 2026 Kamil Alta\r\n");
-    o.Print(L" Licensed under CC BY-NC 4.0 (non-commercial use only)\r\n");
-    o.Print(L" https://creativecommons.org/licenses/by-nc/4.0/\r\n");
+    o.Print(L" Licensed under the GNU General Public License v3.0\r\n");
+    o.Print(L" https://www.gnu.org/licenses/gpl-3.0.html\r\n");
     o.Print(L"\r\n");
     o.Print(L" DISCLAIMER: This tool is provided \"as is\", without any\r\n");
     o.Print(L"    warranty. The author accepts no liability for data loss,\r\n");
@@ -1111,11 +1251,15 @@ static void PrintUsage(Output& out) {
     out.Print(L"                              columns: host,vm,group,type,path,size_bytes,status\r\n");
     out.Print(L"  vmcleaner.exe /task[=<day>]  self-schedule a weekly cleanup (mon..sun, default sun)\r\n");
     out.Print(L"  vmcleaner.exe /task:off      remove the self-scheduled task\r\n");
+    out.Print(L"  vmcleaner.exe /task:status   show the self-scheduled task (read-only, no admin)\r\n");
+    out.Print(L"  vmcleaner.exe /alldrives     allow unscoped /recycle or /delete on ALL drives\r\n");
+    out.Print(L"                              (without a path you must pass /alldrives or type\r\n");
+    out.Print(L"                               ALDRIVES at the prompt; scoping is recommended)\r\n");
     out.Print(L"\r\nExit codes: 0 = ok   1 = error   2 = license declined   3 = cleanup failure(s)\r\n");
     out.Print(L"\r\nExamples:\r\n");
-    out.Print(L"  vmcleaner.exe /delete                      delete after typing YES\r\n");
-    out.Print(L"  vmcleaner.exe D:\\VMs /recycle /yes          recycle a folder without prompt\r\n");
-    out.Print(L"  vmcleaner.exe /recycle /yes /accept /csv:C:\\fleet\\r.csv\r\n");
+    out.Print(L"  vmcleaner.exe /delete                      unscoped: confirm all-drives, type YES\r\n");
+    out.Print(L"  vmcleaner.exe D:\\\\VMs /recycle /yes         recycle a folder (scoped: no confirmation)\r\n");
+    out.Print(L"  vmcleaner.exe /alldrives /recycle /yes /accept /csv:C:\\\\fleet\\\\r.csv\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,8 +1275,10 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring csvOverride;
     std::wstring onlyVendor;   // /only: normalized vendor id ("" = all / default)
     unsigned long long maxAgeDays = 0; // /maxage: days (0 = filter off)
+    bool alldrives = false; // /alldrives: acknowledge unscoped (all-drives) cleanup
     std::vector<std::wstring> customExts;
     int taskOp = 0; // 0=off(no action)  1..7=register on that day  -1=unregister
+    bool taskStatus = false; // /task:status - read-only audit, pre-license
 
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
@@ -1179,6 +1325,7 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (a.rfind(L"/task:", 0) == 0) {
             std::wstring d = ToLowerW(a.substr(6));
             if (d == L"off") taskOp = -1;
+            else if (d == L"status") taskStatus = true;
             else {
                 static const wchar_t* dn[] = { L"mon", L"tue", L"wed", L"thu", L"fri", L"sat", L"sun" };
                 taskOp = 7;
@@ -1192,6 +1339,7 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (a == L"/delete"  || a == L"--delete")       mode = CleanMode::Delete;
         else if (a == L"/yes" || a == L"--yes" || a == L"-y") assumeYes = true;
         else if (a == L"/accept" || a == L"--accept")        assumeLicense = true;
+        else if (a == L"/alldrives" || a == L"--alldrives")  alldrives = true;
         else if (a == L"/?" || a == L"--help" || a == L"-h" || a == L"-help") {
             Output o; PrintUsage(o); return 0;
         }
@@ -1208,6 +1356,24 @@ int wmain(int argc, wchar_t* argv[]) {
     g_maxAgeDays = (ULONGLONG)maxAgeDays;
 
     // License must be agreed before any task (scan or cleanup) runs.
+    // /task:status is read-only fleet auditing and is exempt (no scan, no
+    // cleanup, no registry writes) so it works on unlicensed machines.
+    if (taskStatus) {
+        std::wstring lp = logOverride;
+        if (lp.empty()) {
+            wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
+            lp = std::wstring(cwd) + L"\\vmcleaner_" + NowFileStamp() + L".log";
+        }
+        Logger lg;
+        int st = 0;
+        if (lg.Open(lp)) {
+            lg.Log(L"VM Cleaner v" VERSION_STRING L" - self-scheduled task status");
+            st = StatusTask(lg);
+            lg.Log(L"Log file: " + lp);
+            lg.Close();
+        }
+        return st;
+    }
     if (!LicenseGate(assumeLicense)) return 2;
 
     // /task:off is self-contained (no scan): unregister and exit.
@@ -1232,6 +1398,40 @@ int wmain(int argc, wchar_t* argv[]) {
         wchar_t abs[MAX_PATH];
         if (GetFullPathNameW(customPath.c_str(), MAX_PATH, abs, nullptr))
             customPath = abs;
+    }
+
+    // -----------------------------------------------------------------
+    // SAFETY GUARD: with no path, /delete and /recycle scan AND clean
+    // EVERY drive. That is easy to mistype and dangerous (it can delete
+    // data that merely looks like a VM image). It must be acknowledged
+    // explicitly - either the /alldrives flag, or by typing ALDRIVES at
+    // the prompt - before an unscoped destructive run proceeds.
+    // (A /task: run with no path would otherwise bake this into a weekly
+    // scheduled job.)
+    // -----------------------------------------------------------------
+    if (customPath.empty() && mode != CleanMode::None) {
+        if (!alldrives) {
+            Output o;
+            o.Print(L"\r\n");
+            o.Print(L"====================================================================\r\n");
+            o.Print(L" WARNING: NO PATH GIVEN - this run will scan AND clean ALL\r\n");
+            o.Print(L" drives (C:, D:, ...) for VM files and act on every match.\r\n");
+            o.Print(L" This is dangerous: any file matching a VM extension on any\r\n");
+            o.Print(L" drive will be " + std::wstring(mode == CleanMode::Delete ? L"permanently deleted" : L"recycled") + L".\r\n");
+            o.Print(L"\r\n");
+            o.Print(L" Pass /alldrives to acknowledge this, or type a specific path\r\n");
+            o.Print(L" to scope the run (recommended). In a scheduled task (/task),\r\n");
+            o.Print(L" /alldrives must be part of the command line - otherwise the\r\n");
+            o.Print(L" run aborts every time.\r\n");
+            o.Print(L"====================================================================\r\n");
+            o.Print(L"Continue with ALL drives? Type ALDRIVES to confirm: ");
+            std::string ans = ReadLineA();
+            if (ans != "ALDRIVES" && ans != "alldrives") {
+                o.Print(L"Aborted - no drives were modified.\r\n");
+                return 1;
+            }
+            alldrives = true; // acknowledged interactively - thread into any /task
+        }
     }
 
     std::wstring logPath = logOverride;
@@ -1293,7 +1493,7 @@ int wmain(int argc, wchar_t* argv[]) {
     ApplyAgeFilter(log);
     PrintGroupedReport(log);
 
-    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor, maxAgeDays);
+    if (taskOp >= 1) ScheduleTask(log, taskOp, mode, assumeYes, assumeLicense, csvOverride, g_customExtsArg, onlyVendor, maxAgeDays, customPath, alldrives);
 
     int failed = 0;
     if (mode != CleanMode::None)

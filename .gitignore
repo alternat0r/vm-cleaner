@@ -36,6 +36,9 @@ x86/
 *.recipe
 *.log
 
+# --- test fixtures ---
+testdata/
+
 # --- misc ---
 *.tmp
 Thumbs.db
